@@ -1,0 +1,7 @@
+data/
+checkpoints/
+outputs/
+third_party/
+__pycache__/
+*.pyc
+.DS_Store

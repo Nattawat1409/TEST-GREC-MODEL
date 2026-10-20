@@ -1,0 +1,130 @@
+diff --git a/projects/UNINEXT/configs/eval_optsar_r50.yaml b/projects/UNINEXT/configs/eval_optsar_r50.yaml
+new file mode 100644
+index 0000000..faed871
+--- /dev/null
++++ b/projects/UNINEXT/configs/eval_optsar_r50.yaml
+@@ -0,0 +1,14 @@
++# UNINEXT-R50 (BERT) evaluated on the OptSAR-RSVG test split. Weights: image_joint_r50 from the UNINEXT model zoo.
++_BASE_: "image_joint_r50.yaml"
++MODEL:
++  GREC_MAX_INST: 100  # GREC: keep up to 100 boxes per expression; scripts/evaluate.py picks the box
++DATASETS:
++  TRAIN: ("refcoco-optsar-test", )
++  TEST: ("refcoco-optsar-test", )
++SOLVER:
++  IMS_PER_BATCH: 8
++DATALOADER:
++  DATASET_RATIO: [1]
++  DATASET_BS: [1]
++  USE_RFS: [False]
++OUTPUT_DIR: outputs/eval_optsar_r50
+diff --git a/projects/UNINEXT/train_net.py b/projects/UNINEXT/train_net.py
+index 4a0456a..a057280 100644
+--- a/projects/UNINEXT/train_net.py
++++ b/projects/UNINEXT/train_net.py
+@@ -25,6 +25,7 @@ from detectron2.solver.build import maybe_add_gradient_clipping
+ 
+ from detectron2.projects.uninext import build_detection_train_loader, build_detection_test_loader
+ from detectron2.projects.uninext import add_uninext_config
++from detectron2.projects.uninext.prediction_dumper import PredictionDumper
+ from detectron2.projects.uninext.data import (
+     get_detection_dataset_dicts, DetrDatasetMapperUni, YTVISDatasetMapper, YTVISEvaluator, SOTDatasetMapper, UniVidDatasetMapper
+ )
+@@ -75,7 +76,9 @@ class Trainer(DefaultTrainer):
+             evaluator_list.append(LVISEvaluator(dataset_name, cfg, True, output_folder))
+         elif evaluator_type == "coco":
+             force_tasks = {"bbox"} if "objects365" in cfg.DATASETS.TRAIN[0] else None
+-            if "refcoco" in dataset_name:
++            if "optsar" in dataset_name:
++                evaluator_list.append(PredictionDumper(os.environ.get("OPTSAR_PRED_FILE", os.path.join(output_folder, "uninext_preds.json"))))
++            elif "refcoco" in dataset_name:
+                 evaluator_list.append(COCOEvaluator(dataset_name, cfg, True, output_folder, force_tasks=force_tasks, refcoco=True))
+             elif "coco" in dataset_name or "objects365" in dataset_name or "seginw" in dataset_name:
+                 evaluator_list.append(COCOEvaluator(dataset_name, cfg, True, output_folder, force_tasks=force_tasks, refcoco=False))
+diff --git a/projects/UNINEXT/uninext/config.py b/projects/UNINEXT/uninext/config.py
+index baa5f0b..9cd3106 100644
+--- a/projects/UNINEXT/uninext/config.py
++++ b/projects/UNINEXT/uninext/config.py
+@@ -70,6 +70,7 @@ def add_uninext_config(cfg):
+ 
+ 
+     cfg.MODEL.LANG_GUIDE_DET = True # Language-guided detection (similar to GLIP)
++    cfg.MODEL.GREC_MAX_INST = 1 # boxes kept per expression for grounding (GREC keeps many, then thresholds)
+     cfg.MODEL.VL_FUSION_USE_CHECKPOINT = True # Use gradient checkpoint for VL Early Fusion
+     cfg.MODEL.USE_EARLY_FUSION = True # Use Early Fusion (Bidirectional Cross-Modal Attention)
+     cfg.MODEL.USE_ADDITIONAL_BERT = False # Use additional BERT Layers in early fusion
+diff --git a/projects/UNINEXT/uninext/data/datasets/builtin.py b/projects/UNINEXT/uninext/data/datasets/builtin.py
+index d4c035d..05f0061 100755
+--- a/projects/UNINEXT/uninext/data/datasets/builtin.py
++++ b/projects/UNINEXT/uninext/data/datasets/builtin.py
+@@ -29,6 +29,8 @@ _PREDEFINED_SPLITS_REFCOCO = {
+     # mixed
+     "refcoco-mixed": ("coco/train2014", "annotations/refcoco-mixed/instances_train.json"),
+     "refcoco-mixed-filter": ("coco/train2014", "annotations/refcoco-mixed/instances_train_filter.json"),
++    # OptSAR-RSVG test split from scripts/prepare_optsar_test.py (datasets/optsar -> TEST-GREC-MODEL/data)
++    "refcoco-optsar-test": ("optsar/OptSAR-RSVG/images", "optsar/annotations/optsar_test.json"),
+ }
+ 
+ 
+diff --git a/projects/UNINEXT/uninext/prediction_dumper.py b/projects/UNINEXT/uninext/prediction_dumper.py
+new file mode 100644
+index 0000000..8a74473
+--- /dev/null
++++ b/projects/UNINEXT/uninext/prediction_dumper.py
+@@ -0,0 +1,35 @@
++"""Saves every predicted box + score per expression (original image pixels) for TEST-GREC-MODEL/scripts/evaluate.py."""
++import itertools
++import json
++import os
++
++import detectron2.utils.comm as comm
++from detectron2.evaluation import DatasetEvaluator
++
++
++class PredictionDumper(DatasetEvaluator):
++    def __init__(self, out_file):
++        self.out_file = out_file
++
++    def reset(self):
++        self.predictions = {}
++
++    def process(self, inputs, outputs):
++        for inp, out in zip(inputs, outputs):
++            inst = out["instances"].to("cpu")
++            self.predictions[str(inp["image_id"])] = {
++                "boxes": inst.pred_boxes.tensor.tolist(),
++                "scores": inst.scores.tolist(),
++            }
++
++    def evaluate(self):
++        comm.synchronize()
++        gathered = comm.gather(self.predictions, dst=0)
++        if not comm.is_main_process():
++            return {}
++        predictions = dict(itertools.chain.from_iterable(p.items() for p in gathered))
++        os.makedirs(os.path.dirname(os.path.abspath(self.out_file)), exist_ok=True)
++        with open(self.out_file, "w") as f:
++            json.dump(predictions, f)
++        print(f"saved {len(predictions)} predictions to {self.out_file}")
++        return {}
+diff --git a/projects/UNINEXT/uninext/uninext_img.py b/projects/UNINEXT/uninext/uninext_img.py
+index 9ed9094..b8b4647 100644
+--- a/projects/UNINEXT/uninext/uninext_img.py
++++ b/projects/UNINEXT/uninext/uninext_img.py
+@@ -52,6 +52,7 @@ class UNINEXT_IMG(nn.Module):
+         self.mask_stride = cfg.MODEL.DDETRS.MASK_STRIDE
+         self.mask_on = cfg.MODEL.MASK_ON
+         self.ota = cfg.MODEL.OTA
++        self.grec_max_inst = cfg.MODEL.GREC_MAX_INST
+         self.mask_thres = cfg.MODEL.DDETRS.MASK_THRES
+         self.new_mask_head = cfg.MODEL.DDETRS.NEW_MASK_HEAD
+         self.use_raft = cfg.MODEL.DDETRS.USE_RAFT
+@@ -380,7 +381,7 @@ class UNINEXT_IMG(nn.Module):
+         if task == "detection":
+             max_num_inst = 100
+         elif task == "grounding":
+-            max_num_inst = 1
++            max_num_inst = self.grec_max_inst
+         else:
+             raise ValueError("task must be detection or grounding")
+         assert len(box_cls) == len(image_sizes)

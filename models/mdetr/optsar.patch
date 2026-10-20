@@ -1,0 +1,101 @@
+diff --git a/mdetr/configs/optsar.json b/mdetr/configs/optsar.json
+new file mode 100644
+index 0000000..d8822b8
+--- /dev/null
++++ b/mdetr/configs/optsar.json
+@@ -0,0 +1,8 @@
++{
++    "combine_datasets": ["refexp"],
++    "combine_datasets_val": ["refexp"],
++    "refexp_dataset_name": "optsar",
++    "optsar_img_path": "../../../data/OptSAR-RSVG/images",
++    "optsar_ann_file": "../../../data/annotations/optsar_test.json",
++    "pred_file": "../../../outputs/mdetr_preds.json"
++}
+diff --git a/mdetr/datasets/refexp.py b/mdetr/datasets/refexp.py
+index 1e6536b..e77a70d 100644
+--- a/mdetr/datasets/refexp.py
++++ b/mdetr/datasets/refexp.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
+ import copy
++import json
+ from collections import defaultdict
+ from pathlib import Path
+ import numpy as np
+@@ -18,7 +19,8 @@ class RefExpDetection(ModulatedDetection):
+ 
+ 
+ class RefExpEvaluator(object):
+-    def __init__(self, refexp_gt, iou_types, k=(1, 5, 10), thresh_iou=0.5, thresh_score=0.7, thresh_F1=1.0):
++    def __init__(self, refexp_gt, iou_types, k=(1, 5, 10), thresh_iou=0.5, thresh_score=0.7, thresh_F1=1.0,
++                 dump_path=None):
+         assert isinstance(k, (list, tuple))
+         refexp_gt = copy.deepcopy(refexp_gt)
+         self.refexp_gt = refexp_gt
+@@ -28,6 +30,7 @@ class RefExpEvaluator(object):
+         self.thresh_iou = thresh_iou
+         self.thresh_score = thresh_score
+         self.thresh_F1 = thresh_F1
++        self.dump_path = dump_path
+         print(self.thresh_score)
+     def accumulate(self):
+         pass
+@@ -42,8 +45,18 @@ class RefExpEvaluator(object):
+             merged_predictions.update(p)
+         self.predictions = merged_predictions
+ 
++    def dump(self):
++        """Save all boxes + scores per expression (original image pixels) for scripts/evaluate.py."""
++        out = {str(k): {"boxes": p["boxes"].tolist(), "scores": p["scores"].tolist()} for k, p in self.predictions.items()}
++        Path(self.dump_path).parent.mkdir(parents=True, exist_ok=True)
++        with open(self.dump_path, "w") as f:
++            json.dump(out, f)
++        print(f"predictions saved to {self.dump_path}")
++
+     def summarize(self):
+         if dist.is_main_process():
++            if self.dump_path:
++                self.dump()
+             correct_image = 0
+             num_image = 0
+             nt = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
+@@ -118,8 +131,9 @@ class RefExpEvaluator(object):
+             score = correct_image / num_image
+             results = {}
+             results['F1_score'] = score
+-            results['T_acc'] = nt['TN'] / (nt['TN'] + nt['FP'])
+-            results['N_acc'] = nt['TP'] / (nt['TP'] + nt['FN'])
++            # OptSAR-RSVG has no no-target expressions, so N_acc is undefined there
++            results['T_acc'] = nt['TN'] / (nt['TN'] + nt['FP']) if nt['TN'] + nt['FP'] else float('nan')
++            results['N_acc'] = nt['TP'] / (nt['TP'] + nt['FN']) if nt['TP'] + nt['FN'] else float('nan')
+             print(results, 'results')
+             return results
+         return None
+@@ -129,7 +143,11 @@ def build(image_set, args):
+     img_dir = Path(args.coco_path) / "train2014"
+ 
+     refexp_dataset_name = args.refexp_dataset_name
+-    if refexp_dataset_name in ["refcoco", "refcoco+", "refcocog", "grefcoco"]:
++    if refexp_dataset_name == "optsar":
++        # OptSAR-RSVG test split prepared by scripts/prepare_optsar_test.py (file_name is relative to images/)
++        img_dir = Path(args.optsar_img_path)
++        ann_file = Path(args.optsar_ann_file)
++    elif refexp_dataset_name in ["refcoco", "refcoco+", "refcocog", "grefcoco"]:
+         if args.test:
+             test_set = args.test_type
+             ann_file = Path(args.refexp_ann_path) / f"finetune_{refexp_dataset_name}_{test_set}.json"
+diff --git a/mdetr/main.py b/mdetr/main.py
+index c5beff7..6c28129 100644
+--- a/mdetr/main.py
++++ b/mdetr/main.py
+@@ -478,7 +478,8 @@ def main(args):
+ 
+         evaluator_list.append(CocoEvaluator(base_ds, tuple(iou_types), useCats=False))
+         if "refexp" in dataset_name:
+-            evaluator_list.append(RefExpEvaluator(base_ds, ("bbox")))
++            dump_path = getattr(args, "pred_file", None) if args.eval else None
++            evaluator_list.append(RefExpEvaluator(base_ds, ("bbox"), dump_path=dump_path))
+         if "clevrref" in dataset_name:
+             evaluator_list.append(ClevrRefEvaluator(base_ds, ("bbox")))
+         if "flickr" in dataset_name:
